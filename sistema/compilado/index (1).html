@@ -1,0 +1,317 @@
+<!DOCTYPE html>
+<html lang="pt-br">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Automatos</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}" />
+    <style>
+      :root { color-scheme: light dark; }
+      body { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace; margin: 0; padding: 0; }
+      header { padding: 12px 16px; background: #1f2937; color: #fff; position: sticky; top: 0; }
+      .menu { margin-top: 8px; display: flex; gap: 8px; }
+      .tab { padding: 6px 10px; border-radius: 4px; border: 1px solid #374151; color: #e5e7eb; background: #111827; cursor: pointer; }
+      .tab.active { background: #2563eb; border-color: #2563eb; color: #fff; }
+      main { padding: 12px 16px; }
+      .layout { display: flex; gap: 12px; align-items: stretch; }
+      .col { flex: 1 1 0; }
+      .col.summary { flex: 0 0 40%; max-width: 40%; }
+      .card { background: #0b1020; color: #d1d5db; padding: 12px; border-radius: 6px; }
+      .controls { margin-bottom: 12px; }
+      button { padding: 8px 12px; margin-right: 8px; cursor: pointer; }
+      pre { background: #0b1020; color: #d1d5db; padding: 12px; border-radius: 6px; max-height: 70vh; overflow: auto; white-space: pre-wrap; }
+      .status { font-size: 0.9em; opacity: 0.8; margin-left: 8px; }
+    </style>
+  </head>
+  <body>
+    <header class="app-header">
+      <strong>Automatos</strong> <span class="status"><span id="status-dot" class="dot"></span> <span id="status">Parado</span></span>
+      <div class="menu">
+        <button id="tab-treinamento" class="tab active" data-mode="treinamento">Treinamento</button>
+        <button id="tab-auditoria" class="tab" data-mode="auditoria">Auditoria</button>
+      </div>
+    </header>
+    <main>
+      <div class="controls">
+        <div style="display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin-bottom:8px;">
+          <label>Fonte:</label>
+          <label><input type="radio" name="srcType" value="webcam" checked> Webcam</label>
+          <label><input type="radio" name="srcType" value="video"> Vídeo</label>
+          <label><input type="radio" name="srcType" value="imagem"> Imagem</label>
+          <input id="src-value" type="text" placeholder="Índice da webcam (ex: 0) ou caminho do arquivo" style="min-width:340px;" value="0" />
+          <input id="src-file" type="file" class="hidden" />
+        </div>
+        <div style="display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin-bottom:8px;">
+          <label>Modelo (.pt):</label>
+          <input id="model-path" type="text" placeholder="Caminho do modelo" style="min-width:340px;" value="ModeloTreinadoV3.pt" />
+          <label style="margin-left:8px;">IoU q3:</label>
+          <input id="iou-q3" type="text" value="0.02" style="width:100px;" placeholder="0.02" title="Limiar IoU para considerar amostra dentro da cesta (0 a 1)" />
+        </div>
+        <div style="display:flex; gap:8px; align-items:center;">
+          <button id="btn-start" class="btn btn-primary">Executar</button>
+          <button id="btn-clear" class="btn">Limpar</button>
+          <button id="btn-copy" class="btn btn-small">Copiar logs</button>
+          <button id="btn-download" class="btn btn-small">Baixar resumo</button>
+          <button id="btn-theme" class="btn btn-ghost btn-small">Tema</button>
+        </div>
+      </div>
+      <div class="layout">
+        <div class="col">
+          <div id="log" class="card log-view"></div>
+        </div>
+        <aside class="col summary">
+          <div id="audit-panel" class="card">
+            <h3 style="margin:0 0 8px 0">Resumo Auditoria</h3>
+            <div id="audit-global" style="font-size:0.95em; margin-bottom:8px; opacity:0.9"></div>
+            <div id="audit-list" style="font-family:monospace; white-space:pre-wrap"></div>
+          </div>
+        </aside>
+      </div>
+    </main>
+
+    <script>
+      const logEl = document.getElementById('log');
+      const statusEl = document.getElementById('status');
+      const statusDot = document.getElementById('status-dot');
+      const btnStart = document.getElementById('btn-start');
+      const btnClear = document.getElementById('btn-clear');
+      const btnCopy = document.getElementById('btn-copy');
+      const btnDownload = document.getElementById('btn-download');
+      const btnTheme = document.getElementById('btn-theme');
+      const auditPanel = document.getElementById('audit-panel');
+      const auditListEl = document.getElementById('audit-list');
+      const auditGlobalEl = document.getElementById('audit-global');
+
+      let source = null;
+      let selectedMode = 'treinamento';
+      const srcTypeEls = Array.from(document.querySelectorAll('input[name="srcType"]'));
+      const srcValueEl = document.getElementById('src-value');
+      const srcFileEl = document.getElementById('src-file');
+      const modelPathEl = document.getElementById('model-path');
+      const iouQ3El = document.getElementById('iou-q3');
+      // Restaura último limiar salvo (persistência local)
+      (function(){
+        try {
+          const saved = localStorage.getItem('iou_q3');
+          if (saved && /^\d*(?:[\.,]\d+)?$/.test(saved)) {
+            iouQ3El.value = saved;
+          }
+        } catch {}
+      })();
+
+      function updateSrcInputs() {
+        const type = (srcTypeEls.find(r => r.checked)?.value) || 'webcam';
+        if (type === 'webcam') {
+          srcValueEl.classList.remove('hidden');
+          srcValueEl.placeholder = 'Índice da webcam (ex: 0)';
+          srcValueEl.value = srcValueEl.value && /^\d+$/.test(srcValueEl.value) ? srcValueEl.value : '0';
+          srcFileEl.classList.add('hidden');
+          srcFileEl.value = '';
+        } else if (type === 'video') {
+          srcValueEl.classList.remove('hidden');
+          srcValueEl.placeholder = 'Caminho de vídeo (opcional se enviar arquivo)';
+          srcFileEl.classList.remove('hidden');
+          srcFileEl.accept = 'video/*';
+        } else { // imagem
+          srcValueEl.classList.remove('hidden');
+          srcValueEl.placeholder = 'Caminho de imagem (opcional se enviar arquivo)';
+          srcFileEl.classList.remove('hidden');
+          srcFileEl.accept = 'image/*';
+        }
+      }
+      srcTypeEls.forEach(r => r.addEventListener('change', updateSrcInputs));
+      updateSrcInputs();
+      const tabTreino = document.getElementById('tab-treinamento');
+      const tabAud = document.getElementById('tab-auditoria');
+      function setMode(mode) {
+        selectedMode = mode;
+        tabTreino && tabTreino.classList.toggle('active', mode === 'treinamento');
+        tabAud && tabAud.classList.toggle('active', mode === 'auditoria');
+        btnDownload && (btnDownload.disabled = mode !== 'auditoria');
+        renderAudit();
+      }
+      tabTreino && tabTreino.addEventListener('click', () => setMode('treinamento'));
+      tabAud && tabAud.addEventListener('click', () => setMode('auditoria'));
+      // Hide audit panel by default (treinamento)
+      document.getElementById('audit-panel').style.display = 'none';
+
+      // Audit aggregation state
+      let collecting = false;
+      let currentSummary = null;
+      let auditSummaries = [];
+      let globalCounts = { critical: 0, medium: 0 };
+
+      function renderAudit() {
+        if (selectedMode !== 'auditoria') {
+          auditPanel.style.display = 'none';
+          return;
+        }
+        auditPanel.style.display = '';
+        const total = globalCounts.critical + globalCounts.medium;
+        auditGlobalEl.textContent = `Erros: total=${total}, criticos=${globalCounts.critical}, medios=${globalCounts.medium}`;
+        const parts = [];
+        auditSummaries.forEach(s => {
+          parts.push(`Palavra ${s.palavra}:`);
+          if (!s.errors.length) {
+            parts.push('  Sem erros.');
+          } else {
+            s.errors.forEach(e => parts.push(`  - ${e.tipo} | estado=${e.estado} | ${e.msg}`));
+          }
+          parts.push('');
+        });
+        auditListEl.textContent = parts.join('\n');
+      }
+
+      function resetAudit() {
+        collecting = false;
+        currentSummary = null;
+        auditSummaries = [];
+        globalCounts = { critical: 0, medium: 0 };
+        renderAudit();
+      }
+
+      function classify(line) {
+        if (/^===\s*Palavra/i.test(line)) return 'section';
+        if (/\[BC\]/i.test(line)) return 'bc';
+        if (/\b(erro|error)\b/i.test(line)) return 'error';
+        if (/(Final|Processo finalizado)/i.test(line)) return 'success';
+        if (/Iniciando execucao/i.test(line)) return 'dim';
+        return '';
+      }
+
+      function append(line) {
+        const div = document.createElement('div');
+        div.className = 'log-line ' + classify(line);
+        div.textContent = line;
+        logEl.appendChild(div);
+        logEl.scrollTop = logEl.scrollHeight;
+        // Parse audit summaries from stdout
+        if (selectedMode === 'auditoria') {
+          const startMatch = line.match(/^---\s*Resumo Auditoria \(Palavra\s*(\d+)\)\s*---/i);
+          if (startMatch) {
+            collecting = true;
+            currentSummary = { palavra: parseInt(startMatch[1], 10), errors: [] };
+            return;
+          }
+          if (collecting && /^-+\s*$/.test(line)) {
+            collecting = false;
+            if (currentSummary) {
+              auditSummaries.push(currentSummary);
+              currentSummary = null;
+              renderAudit();
+            }
+            return;
+          }
+          if (collecting) {
+            if (/^Sem erros\.?$/i.test(line)) return;
+            const m = line.match(/tipo\s*=\s*([^,]+),\s*estado\s*=\s*([^,]+),\s*msg\s*=\s*(.*)$/i);
+            if (m && currentSummary) {
+              const tipo = m[1].trim().toLowerCase();
+              const estado = m[2].trim();
+              const msg = m[3].trim();
+              currentSummary.errors.push({ tipo, estado, msg });
+              if (tipo === 'critical') globalCounts.critical++;
+              if (tipo === 'medium') globalCounts.medium++;
+            }
+          }
+        }
+      }
+
+      async function startStream() {
+        if (source) {
+          source.close();
+        }
+        append(`Iniciando execucao (modo: ${selectedMode})...`);
+        if (selectedMode === 'auditoria') resetAudit();
+        statusEl.textContent = 'Executando';
+        statusDot && statusDot.classList.add('ok');
+        btnStart.disabled = true;
+        const srcType = (srcTypeEls.find(r => r.checked)?.value) || 'webcam';
+        let srcVal = (srcValueEl.value || '').trim();
+        if (srcType === 'webcam') {
+          srcVal = srcVal && /^\d+$/.test(srcVal) ? srcVal : '0';
+        }
+        // Se enviou arquivo, faz upload primeiro
+        if ((srcType === 'video' || srcType === 'imagem') && srcFileEl.files && srcFileEl.files.length > 0) {
+          try {
+            const fd = new FormData();
+            fd.append('file', srcFileEl.files[0]);
+            const res = await fetch('/upload', { method: 'POST', body: fd });
+            const data = await res.json();
+            if (!data.ok) throw new Error(data.error || 'Falha no upload');
+            srcVal = data.path;
+            append(`Arquivo carregado: ${srcVal}`);
+          } catch (e) {
+            append(`[erro] upload falhou: ${e}`);
+            statusEl.textContent = 'Parado';
+            statusDot && statusDot.classList.add('err');
+            btnStart.disabled = false;
+            return;
+          }
+        }
+        const model = (modelPathEl.value || '').trim();
+        // Sanitiza IoU: aceita vírgula decimal e limita 0..1, sem alterar o campo exibido
+        let iou_raw = (iouQ3El.value || '').trim().replace(',', '.');
+        let iouNum = parseFloat(iou_raw);
+        if (!isFinite(iouNum)) iouNum = 0.02;
+        iouNum = Math.min(1, Math.max(0, iouNum));
+        const iou_q3 = String(iouNum);
+        try { localStorage.setItem('iou_q3', iou_q3); } catch {}
+        const qs = new URLSearchParams({
+          mode: selectedMode,
+          use: 'automatos',
+          source: srcVal,
+          model: model,
+          iou_q3: iou_q3,
+        });
+        source = new EventSource(`/stream?${qs.toString()}`);
+        source.onmessage = (ev) => {
+          append(ev.data);
+          if (/Processo finalizado/i.test(ev.data)) {
+            statusEl.textContent = 'Parado';
+            statusDot && statusDot.classList.remove('ok','err');
+            btnStart.disabled = false;
+          }
+        };
+        source.onerror = (err) => {
+          append('[erro] conexao encerrada');
+          statusEl.textContent = 'Parado';
+          statusDot && statusDot.classList.add('err');
+          btnStart.disabled = false;
+          source && source.close();
+          source = null;
+        };
+      }
+
+      btnStart.addEventListener('click', startStream);
+      btnClear.addEventListener('click', () => { logEl.innerHTML = ''; resetAudit(); });
+      btnCopy.addEventListener('click', async () => {
+        const text = Array.from(logEl.querySelectorAll('.log-line')).map(n => n.textContent).join('\n');
+        try { await navigator.clipboard.writeText(text); } catch {}
+      });
+      btnDownload.addEventListener('click', () => {
+        if (selectedMode !== 'auditoria') return;
+        const data = { summaries: auditSummaries, counts: globalCounts, ts: Date.now() };
+        const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = 'resumo_auditoria.json';
+        document.body.appendChild(a);
+        a.click();
+        URL.revokeObjectURL(url);
+        a.remove();
+      });
+      // Theme toggle
+      (function(){
+        const saved = localStorage.getItem('theme');
+        if (saved === 'light') document.documentElement.setAttribute('data-theme','light');
+      })();
+      btnTheme.addEventListener('click', () => {
+        const isLight = document.documentElement.getAttribute('data-theme') === 'light';
+        document.documentElement.setAttribute('data-theme', isLight ? 'dark' : 'light');
+        localStorage.setItem('theme', isLight ? 'dark' : 'light');
+      });
+    </script>
+  </body>
+  </html>

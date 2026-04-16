@@ -1,0 +1,4 @@
+from ultralytics import YOLO
+
+model = YOLO("modelo_treinadov2.1 (1).pt")
+print(model.names)

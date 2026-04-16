@@ -1,0 +1,4 @@
+BlockIa/
+besu/logs/*
+node_modules
+besu/.quorumDevQuickstart.lock
