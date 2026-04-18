@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.10;
+pragma solidity ^0.8.20;
 
 contract HashStorage {
 
@@ -12,17 +12,18 @@ contract HashStorage {
         bytes32 indexed storedHash
     );
 
-    event issue(
-        string indexed _issue_i
-    )
+    //event issue(
+    //   string indexed _issue_i
+    //);
+    //, string _issue_i
 
-    function saveHash(bytes32 _hash, string _issue_i) public {
+    function saveHash(bytes32 _hash) public {
         storedHash = _hash;
         emit video(_hash);
-        emit issue(_issue_i)
+       // emit issue(_issue_i);
     }
 }
 
-mapping(bytes32 => bool) public hashExists;
-function register(bytes32 h) external { require(!hashExists[h], "DUPLICATE"); hashExists[h] = true; /* ... */ }
-function existsHash(bytes32 h) external view returns (bool) { return hashExists[h]; }
+//mapping(bytes32 => bool) public hashExists;
+//function register(bytes32 h) external { require(!hashExists[h], "DUPLICATE"); hashExists[h] = true; /* ... */ }
+//function existsHash(bytes32 h) external view returns (bool) { return hashExists[h]; }
