@@ -9,10 +9,16 @@ from web3 import Web3
 from solcx import compile_source, install_solc
 import threading
 from web3.middleware import ExtraDataToPOAMiddleware
+from requests.adapters import HTTPAdapter
+from requests import Session
+
+session = Session()
+adapter = HTTPAdapter(pool_connections=1000, pool_maxsize=1000)
+session.mount("http://", adapter)
 
 # ===== CONFIG =====
 
-w3 = Web3(Web3.HTTPProvider("http://127.0.0.1:8545"))
+w3 = Web3(Web3.HTTPProvider("http://127.0.0.1:8545", session=session))
 w3.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
 nonce_lock = threading.Lock()
 
@@ -46,6 +52,7 @@ def compile_contract(source: str, solc_version="0.8.20"):
 
 def deploy_contract(abi, bytecode):
     global funding_private_key
+    #0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80
     assert w3.is_connected()
 
     account = w3.eth.account.from_key(funding_private_key)
@@ -66,7 +73,7 @@ def deploy_contract(abi, bytecode):
         'from': address,
         'nonce': nonce,
         'gas': int(gas_estimate * 1.3),
-        'gasPrice': 1,  
+        'gasPrice': 0,  #1
         'chainId': 1337
     })
 
@@ -76,41 +83,49 @@ def deploy_contract(abi, bytecode):
 
     receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=300)
 
-
     return receipt.contractAddress
 
-def rodar_benchmark(total_tx: int, threads: int, contract_address):
+def rodar_benchmark(total_accounts: int, contract_address):
     resultados = []
 
     global w3
 
+    # cria total contas
+    accounts = [w3.eth.account.create() for _ in range(total_accounts)]
 
-    accounts = [w3.eth.account.create() for _ in range(total_tx)]
-    txs = []
-    txs  = fund_account(accounts, 0.01)
+    # funding
+    txs = fund_account(accounts, 0.01)
 
     for tx in txs:
         w3.eth.wait_for_transaction_receipt(tx)
-    
+
     inicio_total = time.perf_counter()
 
-    with ThreadPoolExecutor(max_workers=threads) as executor:
+
+    #max 12 -> 120
+    with ThreadPoolExecutor(max_workers=total_accounts) as executor:
         futures = [
-            executor.submit(enviar_transacao, i, contract_address, accounts[i].key, total_tx)
-            for i in range(total_tx)
+            executor.submit(
+                enviar_transacao,
+                i,
+                contract_address,
+                accounts[i].key
+            )
+            for i in range(total_accounts)
         ]
 
         for future in as_completed(futures):
             resultados.append(future.result())
+
     fim_total = time.perf_counter()
+
     resumo = calcular_resumo(
         resultados,
-        total_tx,
-        threads,
+        total_accounts,
+        total_accounts,
         inicio_total,
         fim_total
     )
-    
 
     return resumo, resultados
 
@@ -133,8 +148,8 @@ def fund_account(accounts, value_eth):
         tx = {
             "to": acc.address,
             "value": w3.to_wei(value_eth, "ether"),
-            "gas": 21000,               # Fixed for ETH transfers
-            "gasPrice": gas_estimate,      # Correct Wei per gas
+            "gas": int(gas_estimate * 1.3),               # Fixed for ETH transfers
+            "gasPrice": 0,      # Correct Wei per gas
             "nonce": nonce + i,    # Sequential, gap-safe
             "chainId": 1337         # Dynamic, not hardcoded
         }
@@ -152,6 +167,7 @@ def criar_conta():
 BASE_DIR = Path(__file__).resolve().parent.parent
 NODE_SCRIPT = BASE_DIR / "besu" / "smart_contracts" / "scripts" / "public" / "hre_hash2.js"
 CONTRACT_ADDRESS = ""
+
 abi, bytecode = compile_contract("contracts/hash.sol")
 
 TIMEOUT = 120
@@ -160,7 +176,7 @@ TIMEOUT = 120
 
 # Ajuste os cenarios como quiser
 CENARIOS = [
-    (10, 1),
+    (10)
 ]
 
 
@@ -177,92 +193,78 @@ def calcular_p95(valores):
     return valores[idx]
 
 
-def send_contract_transaction(
+def send_single_transaction(
     w3,
     contract_address,
     abi,
     private_key,
-    tx_total,
-    gas=200000,
     gasPrice=1,
-    chain_id=None
 ):
     start = time.perf_counter()
-   
-    if chain_id is None:
-        chain_id = w3.eth.chain_id
 
     account = w3.eth.account.from_key(private_key)
     address = account.address
 
     contract = w3.eth.contract(address=contract_address, abi=abi)
- 
+
     nonce = w3.eth.get_transaction_count(address, "pending")
 
-   
-    tx_hashes = []
-    for i in range(tx_total):
-        func = contract.functions.saveHash(
-            Web3.keccak(text=f"tx-{i}")
-        )
+    func = contract.functions.saveHash(
+        Web3.keccak(text=f"tx-{time.time_ns()}")
+    )
 
-        # 🔥 estimate gas (evita erro)
-        gas_estimate = func.estimate_gas({'from': address})
+    gas_estimate = func.estimate_gas({'from': address})
 
+    tx = func.build_transaction({
+        'from': address,
+        'nonce': nonce,
+        'gas': int(gas_estimate * 1.2),
+        'gasPrice': gasPrice,
+        "chainId": w3.eth.chain_id
+    })
 
-        tx = func.build_transaction({
-            'from': address,
-            'nonce': nonce + i,
-            'gas': int(gas_estimate * 1.2),
-            'gasPrice': gasPrice,
-            "chainId": w3.eth.chain_id
-        })
-
-        signed = w3.eth.account.sign_transaction(tx, private_key)
-        tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
-        tx_hashes.append(tx_hash)
+    signed = w3.eth.account.sign_transaction(tx, private_key)
+    tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
 
     end = time.perf_counter()
 
-    tps = tx_total / (end - start)
-
-    return tx_hashes, tps
+    return tx_hash, (end - start)
 
 
 
-def enviar_transacao(i: int, contract_address, account, total_tx):
+def enviar_transacao(i: int, contract_address, private_key):
     inicio = time.perf_counter()
+
     try:
         global abi
         global w3
-      
-        # enviar tx
-        tx_hashes, tps = send_contract_transaction(
+
+        tx_hash, tempo = send_single_transaction(
             w3,
             contract_address,
             abi,
-            account,
-            total_tx)
+            private_key
+        )
 
         fim = time.perf_counter()
-       
+
         return {
             "id": i,
             "ok": True,
-            "txs": len(tx_hashes),
-            "tps": tps,
-            "latencia": fim - inicio
-            }
-        
+            "txs": 1,
+            "tx_hash": tx_hash.hex(),
+            "latencia_tx": tempo,
+            "latencia_thread": fim - inicio,
+        }
 
     except Exception as e:
         fim = time.perf_counter()
 
         return {
             "id": i,
-            "ok": False,
+            "ok": False, "id": i,
             "erro": str(e),
-            "latencia": fim - inicio
+            "latencia_thread": fim - inicio
         }
     
 def calcular_resumo(resultados, total_tx, threads, inicio_total, fim_total):
@@ -271,7 +273,18 @@ def calcular_resumo(resultados, total_tx, threads, inicio_total, fim_total):
     sucessos = [r for r in resultados if r.get("ok")]
     falhas = [r for r in resultados if not r.get("ok")]
 
-    latencias = [r["latencia"] for r in resultados if "latencia" in r]
+    # 🔥 agora cada sucesso = 1 tx
+    total_tx_executadas = len(sucessos)
+
+    # 🔥 latência da thread (tempo total da execução)
+    latencias_thread = [
+        r["latencia_thread"] for r in resultados if "latencia_thread" in r
+    ]
+
+    # 🔥 latência real da tx (melhor métrica agora)
+    latencias_tx = [
+        r["latencia_tx"] for r in sucessos if "latencia_tx" in r
+    ]
 
     def p95(lista):
         if not lista:
@@ -282,44 +295,94 @@ def calcular_resumo(resultados, total_tx, threads, inicio_total, fim_total):
 
     resumo = {
         "threads": threads,
-        "total_tx": total_tx,
+
+        # 📊 volume
+        "total_tx_config": total_tx,
+        "total_tx_executadas": total_tx_executadas,
+
+        # ✔ status
         "sucessos": len(sucessos),
         "falhas": len(falhas),
+
+        # ⏱ tempo total
         "tempo_total": tempo_total,
-        "tps": (len(sucessos) / tempo_total) if tempo_total > 0 else 0.0,
-        "lat_media": statistics.mean(latencias) if latencias else 0.0,
-        "lat_mediana": statistics.median(latencias) if latencias else 0.0,
-        "lat_min": min(latencias) if latencias else 0.0,
-        "lat_max": max(latencias) if latencias else 0.0,
-        "p95": p95(latencias),
+
+        # 🚀 TPS REAL (envio)
+        "tps_envio": (
+            total_tx_executadas / tempo_total if tempo_total > 0 else 0.0
+        ),
+
+        # 📉 latência da thread
+        "lat_thread_media": statistics.mean(latencias_thread) if latencias_thread else 0.0,
+        "lat_thread_p95": p95(latencias_thread),
+
+        # 📉 latência da transação (mais importante agora)
+        "lat_tx_media": statistics.mean(latencias_tx) if latencias_tx else 0.0,
+        "lat_tx_mediana": statistics.median(latencias_tx) if latencias_tx else 0.0,
+        "lat_tx_min": min(latencias_tx) if latencias_tx else 0.0,
+        "lat_tx_max": max(latencias_tx) if latencias_tx else 0.0,
+        "lat_tx_p95": p95(latencias_tx),
     }
 
-    return resumo   
+    return resumo
 
 
 
 
 def imprimir_resumo(resumo):
     print(f"Threads: {resumo['threads']}")
-    print(f"Total TX: {resumo['total_tx']}")
+
+    # 📊 volume
+    print(f"Total TX (config): {resumo['total_tx_config']}")
+    print(f"Total TX (executadas): {resumo['total_tx_executadas']}")
+
+    # ✔ status
     print(f"Sucessos: {resumo['sucessos']}")
     print(f"Falhas: {resumo['falhas']}")
+
+    # ⏱ tempo
     print(f"Tempo total: {resumo['tempo_total']:.4f}s")
-    print(f"TXS: {resumo['txs']:.4f}")
-    print(f"TPS: {resumo['tps']:.4f}")
-    print(f"Lat media: {resumo['lat_media']:.4f}s")
-    print(f"Lat mediana: {resumo['lat_mediana']:.4f}s")
-    print(f"Lat min: {resumo['lat_min']:.4f}s")
-    print(f"Lat max: {resumo['lat_max']:.4f}s")
-    print(f"P95: {resumo['p95']:.4f}s")
+
+    # 🚀 TPS
+    print(f"TPS (envio): {resumo['tps_envio']:.4f}")
+
+    # 📉 latência thread
+    print(f"Latência thread média: {resumo['lat_thread_media']:.4f}s")
+    print(f"Latência thread P95: {resumo['lat_thread_p95']:.4f}s")
+
+    # 📉 latência real da tx
+    print(f"Latência TX média: {resumo['lat_tx_media']:.4f}s")
+    print(f"Latência TX mediana: {resumo['lat_tx_mediana']:.4f}s")
+    print(f"Latência TX min: {resumo['lat_tx_min']:.4f}s")
+    print(f"Latência TX max: {resumo['lat_tx_max']:.4f}s")
+    print(f"P95 TX: {resumo['lat_tx_p95']:.4f}s")
+
     print("-" * 40)
 
 
 def imprimir_amostra_erros(resultados, limite=3):
-    erros = [r for r in resultados if not r["ok"]]
+    erros = [r for r in resultados if not r.get("ok")]
+
+    print(f"\n❌ Total de erros: {len(erros)}")
+
+    if not erros:
+        print("Nenhum erro encontrado ✅")
+        return
+
+    print(f"Mostrando até {limite} erros:\n")
 
     for r in erros[:limite]:
-        print(f"TX {r['id']} | erro: {r.get('erro')}")
+        print(f"TX ID: {r.get('id')}")
+        print(f"Erro: {r.get('erro')}")
+
+        # 🔍 extras úteis (se existirem)
+        if "latencia_thread" in r:
+            print(f"Latência thread: {r.get('latencia_thread'):.4f}s")
+
+        if "tx_hash" in r:
+            print(f"TX Hash: {r.get('tx_hash')}")
+
+        print("-" * 40)
 
 
    
@@ -332,8 +395,8 @@ def main():
     add = deploy_contract(abi, bytecode)
     #rodar_benchmark(1, 1, add)
     
-    for total_tx, threads in CENARIOS:
-        resumo,resultados =rodar_benchmark(total_tx, threads, add)
+    for total_accounts in CENARIOS:
+        resumo,resultados = rodar_benchmark(total_accounts, add)
         imprimir_resumo(resumo)
         imprimir_amostra_erros(resultados)
     
