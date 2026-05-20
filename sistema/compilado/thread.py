@@ -176,7 +176,12 @@ TIMEOUT = 120
 
 # Ajuste os cenarios como quiser
 CENARIOS = [
-    (10)
+    1, 2, 4, 9, 16, 25, 36, 49,
+    64, 81, 100, 121, 144, 169,
+    196, 225, 256, 289, 324,
+    361, 400, 441, 484, 529,
+    576, 625, 676, 729, 784,
+    841, 900, 961
 ]
 
 
@@ -239,13 +244,24 @@ def enviar_transacao(i: int, contract_address, private_key):
         global abi
         global w3
 
-        tx_hash, tempo = send_single_transaction(
+        tx_hash, tempo_envio = send_single_transaction(
             w3,
             contract_address,
             abi,
             private_key
         )
 
+         # 🚀 mede confirmação REAL
+        inicio_confirmacao = time.perf_counter()
+
+        receipt = w3.eth.wait_for_transaction_receipt(tx_hash)
+
+        fim_confirmacao = time.perf_counter()
+
+        tempo_confirmacao = (
+            fim_confirmacao - inicio_confirmacao
+        )
+      
         fim = time.perf_counter()
 
         return {
@@ -253,8 +269,15 @@ def enviar_transacao(i: int, contract_address, private_key):
             "ok": True,
             "txs": 1,
             "tx_hash": tx_hash.hex(),
-            "latencia_tx": tempo,
+            "confirmada": receipt.status == 1,
+            "latencia_confirmacao": tempo_confirmacao,
+            "latencia_tx": tempo_envio,
             "latencia_thread": fim - inicio,
+            # ⛓ bloco
+            "block_number": receipt.blockNumber,
+
+            # ⛽ gas
+            "gas_used": receipt.gasUsed,
         }
 
     except Exception as e:
@@ -267,7 +290,11 @@ def enviar_transacao(i: int, contract_address, private_key):
             "latencia_thread": fim - inicio
         }
     
-def calcular_resumo(resultados, total_tx, threads, inicio_total, fim_total):
+def calcular_resumo(resultados, total_tx, threads, inicio_total, fim_total,tx_hashes=None,
+    receipts=None,
+    inicio_confirmacao=None,
+    fim_confirmacao=None ):
+
     tempo_total = fim_total - inicio_total
 
     sucessos = [r for r in resultados if r.get("ok")]
@@ -286,6 +313,27 @@ def calcular_resumo(resultados, total_tx, threads, inicio_total, fim_total):
         r["latencia_tx"] for r in sucessos if "latencia_tx" in r
     ]
 
+     # ⛓ latência confirmação blockchain
+    latencias_confirmacao = [
+        r["latencia_confirmacao"]
+        for r in sucessos
+        if "latencia_confirmacao" in r
+    ]
+
+     # ⛽ gas usado
+    gas_used = [
+        r["gas_used"]
+        for r in sucessos
+        if "gas_used" in r
+    ]
+
+    # 🔥 confirmação blockchain
+    confirmadas = sum(
+        1 for r in resultados
+        if r.get("confirmada")
+    )
+   
+  
     def p95(lista):
         if not lista:
             return 0.0
@@ -304,24 +352,64 @@ def calcular_resumo(resultados, total_tx, threads, inicio_total, fim_total):
         "sucessos": len(sucessos),
         "falhas": len(falhas),
 
+        # ✔ status blockchain
+        "confirmadas": confirmadas,
+
         # ⏱ tempo total
         "tempo_total": tempo_total,
-
+        # quantidade de transações SUBMETIDAS por segundo
         # 🚀 TPS REAL (envio)
+
+       
         "tps_envio": (
             total_tx_executadas / tempo_total if tempo_total > 0 else 0.0
         ),
+
 
         # 📉 latência da thread
         "lat_thread_media": statistics.mean(latencias_thread) if latencias_thread else 0.0,
         "lat_thread_p95": p95(latencias_thread),
 
         # 📉 latência da transação (mais importante agora)
-        "lat_tx_media": statistics.mean(latencias_tx) if latencias_tx else 0.0,
-        "lat_tx_mediana": statistics.median(latencias_tx) if latencias_tx else 0.0,
-        "lat_tx_min": min(latencias_tx) if latencias_tx else 0.0,
-        "lat_tx_max": max(latencias_tx) if latencias_tx else 0.0,
-        "lat_tx_p95": p95(latencias_tx),
+        "lat_envio_media": statistics.mean(latencias_tx) if latencias_tx else 0.0,
+        "lat_envio_p95": p95(latencias_tx),
+        # 🚀 envio RPC
+        
+        # ⛓ confirmação blockchain
+        "lat_confirmacao_media": (
+            statistics.mean(latencias_confirmacao)
+            if latencias_confirmacao else 0.0
+        ),
+
+        "lat_confirmacao_mediana": (
+            statistics.median(latencias_confirmacao)
+            if latencias_confirmacao else 0.0
+        ),
+
+        "lat_confirmacao_min": (
+            min(latencias_confirmacao)
+            if latencias_confirmacao else 0.0
+        ),
+
+        "lat_confirmacao_max": (
+            max(latencias_confirmacao)
+            if latencias_confirmacao else 0.0
+        ),
+
+        "lat_confirmacao_p95": p95(
+            latencias_confirmacao
+        ),
+
+        # ⛽ gas
+        "gas_medio": (
+            statistics.mean(gas_used)
+            if gas_used else 0.0
+        ),
+
+        "gas_max": (
+            max(gas_used)
+            if gas_used else 0.0
+        ),
     }
 
     return resumo
@@ -330,35 +418,73 @@ def calcular_resumo(resultados, total_tx, threads, inicio_total, fim_total):
 
 
 def imprimir_resumo(resumo):
+
+    print("\n========== RESUMO BENCHMARK ==========")
+
+    # 🧵 concorrência
     print(f"Threads: {resumo['threads']}")
 
     # 📊 volume
     print(f"Total TX (config): {resumo['total_tx_config']}")
     print(f"Total TX (executadas): {resumo['total_tx_executadas']}")
 
-    # ✔ status
-    print(f"Sucessos: {resumo['sucessos']}")
-    print(f"Falhas: {resumo['falhas']}")
+    # ✔ envio
+    print(f"Sucessos envio: {resumo['sucessos']}")
+    print(f"Falhas envio: {resumo['falhas']}")
+    print(f"TX confirmadas: {resumo['confirmadas']}")
 
-    # ⏱ tempo
-    print(f"Tempo total: {resumo['tempo_total']:.4f}s")
-
+    # ⏱ tempos
+    print(f"Tempo envio: {resumo['tempo_total']:.4f}s")
+  
     # 🚀 TPS
-    print(f"TPS (envio): {resumo['tps_envio']:.4f}")
-
+    print(f"TPS envio: {resumo['tps_envio']:.4f}")
+ 
     # 📉 latência thread
     print(f"Latência thread média: {resumo['lat_thread_media']:.4f}s")
     print(f"Latência thread P95: {resumo['lat_thread_p95']:.4f}s")
 
-    # 📉 latência real da tx
-    print(f"Latência TX média: {resumo['lat_tx_media']:.4f}s")
-    print(f"Latência TX mediana: {resumo['lat_tx_mediana']:.4f}s")
-    print(f"Latência TX min: {resumo['lat_tx_min']:.4f}s")
-    print(f"Latência TX max: {resumo['lat_tx_max']:.4f}s")
-    print(f"P95 TX: {resumo['lat_tx_p95']:.4f}s")
+  # 🚀 latência envio RPC
+    print(
+        f"Latência envio média: "
+        f"{resumo['lat_envio_media']:.4f}s"
+    )
 
-    print("-" * 40)
+    print(
+        f"Latência envio P95: "
+        f"{resumo['lat_envio_p95']:.4f}s"
+    )
 
+    # ⛓ latência confirmação blockchain
+    print(
+        f"Latência confirmação média: "
+        f"{resumo['lat_confirmacao_media']:.4f}s"
+    )
+
+    print(
+        f"Latência confirmação mediana: "
+        f"{resumo['lat_confirmacao_mediana']:.4f}s"
+    )
+
+    print(
+        f"Latência confirmação min: "
+        f"{resumo['lat_confirmacao_min']:.4f}s"
+    )
+
+    print(
+        f"Latência confirmação max: "
+        f"{resumo['lat_confirmacao_max']:.4f}s"
+    )
+
+    print(
+        f"Latência confirmação P95: "
+        f"{resumo['lat_confirmacao_p95']:.4f}s"
+    )
+
+    # ⛽ gas
+    print(f"Gas médio: {resumo['gas_medio']:.2f}")
+    print(f"Gas máximo: {resumo['gas_max']}")
+
+    print("======================================\n")
 
 def imprimir_amostra_erros(resultados, limite=3):
     erros = [r for r in resultados if not r.get("ok")]
