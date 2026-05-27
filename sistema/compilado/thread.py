@@ -1,7 +1,8 @@
+import csv
 import time
 import hashlib
 import subprocess
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import CancelledError, ThreadPoolExecutor, as_completed
 from pathlib import Path
 import statistics
 import os
@@ -11,6 +12,13 @@ import threading
 from web3.middleware import ExtraDataToPOAMiddleware
 from requests.adapters import HTTPAdapter
 from requests import Session
+
+from concurrent.futures import (
+    ThreadPoolExecutor,
+    TimeoutError,
+    CancelledError
+)
+
 
 session = Session()
 adapter = HTTPAdapter(pool_connections=1000, pool_maxsize=1000)
@@ -29,6 +37,8 @@ funding_nonce = w3.eth.get_transaction_count(funding_account.address)
 
 
 
+
+#compila contrato
 def compile_contract(source: str, solc_version="0.8.20"):
     
     install_solc(solc_version)
@@ -50,6 +60,7 @@ def compile_contract(source: str, solc_version="0.8.20"):
 
     return contract_interface['abi'], contract_interface['bin']
 
+#deploy contrato com carteira uma carteira criada pela rede besu (funding_private_key) que já tem ETH; 
 def deploy_contract(abi, bytecode):
     global funding_private_key
     #0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80
@@ -85,10 +96,131 @@ def deploy_contract(abi, bytecode):
 
     return receipt.contractAddress
 
+def enviar_transacao(
+    i: int,
+    contract_address,
+    private_key,
+    stop_event,
+):
+
+    inicio_thread = time.perf_counter()
+    resultados = []
+
+
+    try:
+
+        global abi
+        global w3
+
+        account = w3.eth.account.from_key(private_key)
+        address = account.address
+
+        contract = w3.eth.contract(
+            address=contract_address,
+            abi=abi
+        )
+
+        nonce = w3.eth.get_transaction_count(
+            address,
+            "pending"
+        )
+
+        while not stop_event.is_set():
+            try: 
+
+                func = contract.functions.saveHash(
+                    Web3.keccak(
+                        text=f"tx-{time.time_ns()}"
+                    )
+                )
+
+                gas_estimate = func.estimate_gas({
+                    'from': address
+                })
+
+                tx = func.build_transaction({
+                    'from': address,
+                    'nonce': nonce,
+                    'gas': int(gas_estimate * 1.2),
+                    'gasPrice': 0,
+                    'chainId': w3.eth.chain_id
+                })
+
+                signed = w3.eth.account.sign_transaction(
+                    tx,
+                    private_key
+                )
+
+                inicio_envio = time.perf_counter()
+
+                tx_hash = w3.eth.send_raw_transaction(
+                    signed.raw_transaction
+                )
+
+                fim_envio = time.perf_counter()
+
+                receipt = w3.eth.wait_for_transaction_receipt(
+                    tx_hash
+                )
+
+                fim_confirmacao = time.perf_counter()
+
+                nonce += 1
+
+                resultados.append({
+                    "thread_id": i,
+                    "ok": True,
+                    "tx_hash": tx_hash.hex(),
+                    "confirmada":
+                        receipt.status == 1,
+
+                    "block_number":
+                        receipt.blockNumber,
+
+                    "gas_used":
+                        receipt.gasUsed,
+
+                    "latencia_rpc":
+                        fim_envio - inicio_envio,
+
+                    "latencia_confirmacao":
+                        fim_confirmacao - fim_envio,
+
+                    "latencia_total":
+                        fim_confirmacao - inicio_envio,
+
+                    "latencia_thread":
+                        fim_confirmacao - inicio_thread
+                })
+
+                nonce += 1
+
+            except Exception as e:
+
+                    resultados.append({
+                        "thread_id": i,
+                        "ok": False,
+                         "erro": str(e)
+                    })
+
+        return resultados
+
+    except Exception as e:
+
+        return [{
+            "thread_id": i,
+            "ok": False,
+            "erro": str(e)
+        }]
+
+# função principal do benchmark, roda o cenário completo e retorna o resumo e os resultados detalhados;
 def rodar_benchmark(total_accounts: int, contract_address):
+    #array de resultados detalhados de cada thread (sucesso, latências, erros, etc)
     resultados = []
 
     global w3
+
+    stop_event = threading.Event()
 
     # cria total contas
     accounts = [w3.eth.account.create() for _ in range(total_accounts)]
@@ -109,23 +241,81 @@ def rodar_benchmark(total_accounts: int, contract_address):
                 enviar_transacao,
                 i,
                 contract_address,
-                accounts[i].key
+                accounts[i].key,
+                stop_event
             )
             for i in range(total_accounts)
         ]
 
-        for future in as_completed(futures):
-            resultados.append(future.result())
+        # deixa executar por 5 segundos
+        time.sleep(1)
 
+        print("Parando benchmark...")
+
+        # cancela futuras tasks ainda não iniciadas
+        executor.shutdown(
+            wait=False,
+            cancel_futures=True
+        )
+
+        for idx, future in enumerate(futures):
+
+            try:
+
+                if future.done():
+
+                    resultado = future.result()
+
+                else:
+
+                    resultado = {
+                        "id": idx,
+                        "ok": False,
+                        "erro": "timeout",
+                        "latencia_thread": 0
+                    }
+
+            except TimeoutError:
+
+                resultado = {
+                    "id": idx,
+                    "ok": False,
+                    "erro": "timeout",
+                    "latencia_thread": 0
+                }
+
+            except CancelledError:
+
+                resultado = {
+                    "id": idx,
+                    "ok": False,
+                    "erro": "task cancelada",
+                    "latencia_thread": 0
+                }
+
+            except Exception as e:
+
+                resultado = {
+                    "id": idx,
+                    "ok": False,
+                    "erro": str(e),
+                    "latencia_thread": 0
+                }
+
+            resultados.append(resultado)
+   
     fim_total = time.perf_counter()
 
     resumo = calcular_resumo(
         resultados,
         total_accounts,
-        total_accounts,
+        len(resultados),
         inicio_total,
         fim_total
     )
+
+    #exportar em CSV.
+   
 
     return resumo, resultados
 
@@ -176,15 +366,14 @@ TIMEOUT = 120
 
 # Ajuste os cenarios como quiser
 CENARIOS = [
-    1, 2, 4, 9, 16, 25, 36, 49,
-    64, 81, 100, 121, 144, 169,
-    196, 225, 256, 289, 324,
-    361, 400, 441, 484, 529,
-    576, 625, 676, 729, 784,
-    841, 900, 961
+    45
 ]
 
-
+#, 2, 4, 9, 16, 25, 36, 49, 64, 81, 100, 121, 144, 169,
+#196, 225, 256, 289, 324,
+#    361, 400, 441, 484, 529,
+#    576, 625, 676, 729, 784,
+#    841, 900, 961
 def gerar_hash_unico(i: int) -> str:
     payload = f"tx-{i}-{time.time_ns()}".encode()
     return "0x" + hashlib.sha256(payload).hexdigest()
@@ -198,109 +387,14 @@ def calcular_p95(valores):
     return valores[idx]
 
 
-def send_single_transaction(
-    w3,
-    contract_address,
-    abi,
-    private_key,
-    gasPrice=1,
-):
-    start = time.perf_counter()
-
-    account = w3.eth.account.from_key(private_key)
-    address = account.address
-
-    contract = w3.eth.contract(address=contract_address, abi=abi)
-
-    nonce = w3.eth.get_transaction_count(address, "pending")
-
-    func = contract.functions.saveHash(
-        Web3.keccak(text=f"tx-{time.time_ns()}")
-    )
-
-    gas_estimate = func.estimate_gas({'from': address})
-
-    tx = func.build_transaction({
-        'from': address,
-        'nonce': nonce,
-        'gas': int(gas_estimate * 1.2),
-        'gasPrice': gasPrice,
-        "chainId": w3.eth.chain_id
-    })
-
-    signed = w3.eth.account.sign_transaction(tx, private_key)
-    tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
-
-    end = time.perf_counter()
-
-    return tx_hash, (end - start)
-
-
-
-def enviar_transacao(i: int, contract_address, private_key):
-    inicio = time.perf_counter()
-
-    try:
-        global abi
-        global w3
-
-        tx_hash, tempo_envio = send_single_transaction(
-            w3,
-            contract_address,
-            abi,
-            private_key
-        )
-
-         # 🚀 mede confirmação REAL
-        inicio_confirmacao = time.perf_counter()
-
-        receipt = w3.eth.wait_for_transaction_receipt(tx_hash)
-
-        fim_confirmacao = time.perf_counter()
-
-        tempo_confirmacao = (
-            fim_confirmacao - inicio_confirmacao
-        )
-      
-        fim = time.perf_counter()
-
-        return {
-            "id": i,
-            "ok": True,
-            "txs": 1,
-            "tx_hash": tx_hash.hex(),
-            "confirmada": receipt.status == 1,
-            "latencia_confirmacao": tempo_confirmacao,
-            "latencia_tx": tempo_envio,
-            "latencia_thread": fim - inicio,
-            # ⛓ bloco
-            "block_number": receipt.blockNumber,
-
-            # ⛽ gas
-            "gas_used": receipt.gasUsed,
-        }
-
-    except Exception as e:
-        fim = time.perf_counter()
-
-        return {
-            "id": i,
-            "ok": False, "id": i,
-            "erro": str(e),
-            "latencia_thread": fim - inicio
-        }
     
-def calcular_resumo(resultados, total_tx, threads, inicio_total, fim_total,tx_hashes=None,
-    receipts=None,
-    inicio_confirmacao=None,
-    fim_confirmacao=None ):
+def calcular_resumo(resultados, total_tx, threads, inicio_total, fim_total):
 
     tempo_total = fim_total - inicio_total
 
     sucessos = [r for r in resultados if r.get("ok")]
     falhas = [r for r in resultados if not r.get("ok")]
-
-    # 🔥 agora cada sucesso = 1 tx
+    
     total_tx_executadas = len(sucessos)
 
     # 🔥 latência da thread (tempo total da execução)
@@ -486,9 +580,9 @@ def imprimir_resumo(resumo):
 
     print("======================================\n")
 
-def imprimir_amostra_erros(resultados, limite=3):
+def imprimir_amostra_erros(resultados ):
     erros = [r for r in resultados if not r.get("ok")]
-
+    limite=len(resultados)
     print(f"\n❌ Total de erros: {len(erros)}")
 
     if not erros:
