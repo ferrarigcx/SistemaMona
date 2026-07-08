@@ -104,128 +104,88 @@ def enviar_transacao(
 ):
 
     inicio_thread = time.perf_counter()
+
+    account = w3.eth.account.from_key(private_key)
+    address = account.address
+
     resultados = []
 
+    contract = w3.eth.contract(
+        address=contract_address,
+        abi=abi
+    )
 
-    try:
+    nonce = w3.eth.get_transaction_count(
+        address,
+        "pending"
+    )
 
-        global abi
-        global w3
+    while not stop_event.is_set():
 
-        account = w3.eth.account.from_key(private_key)
-        address = account.address
+        try:
 
-        contract = w3.eth.contract(
-            address=contract_address,
-            abi=abi
-        )
+            func = contract.functions.saveHash(Web3.keccak(text=f"{time.time_ns()}") )
+            gas_estimate = func.estimate_gas({ 'from': address })
+            tx = func.build_transaction({ 'from': address, 'nonce': nonce, 'gas': int(gas_estimate * 1.2), 'gasPrice': 0, 'chainId': w3.eth.chain_id })
+            signed = w3.eth.account.sign_transaction( tx, private_key )
+            inicio_envio = time.perf_counter()
+            tx_hash = w3.eth.send_raw_transaction( signed.raw_transaction )
+            fim_envio = time.perf_counter()
+            receipt = w3.eth.wait_for_transaction_receipt(
+                 tx_hash,
+                timeout=5
+            )
+            fim_confirmacao = time.perf_counter()
+            
+            if receipt.status == 1: nonce += 1
 
-        nonce = w3.eth.get_transaction_count(
-            address,
-            "pending"
-        )
+            # envia a transação
 
-        while not stop_event.is_set():
-            try: 
+            resultados.append({
+                "ok": True,
+                "tx_hash": tx_hash.hex(),
+                "confirmada": receipt.status == 1,
+                "block_number": receipt.blockNumber,
+                "gas_used": receipt.gasUsed,
+                "latencia_rpc": fim_envio - inicio_envio,
+                "latencia_confirmacao": fim_confirmacao - fim_envio,
+                "latencia_tx": fim_confirmacao - inicio_envio,
+                "latencia_thread": fim_confirmacao - inicio_thread
+            })
 
-                func = contract.functions.saveHash(
-                    Web3.keccak(
-                        text=f"tx-{time.time_ns()}"
-                    )
-                )
+          
 
-                gas_estimate = func.estimate_gas({
-                    'from': address
-                })
-
-                tx = func.build_transaction({
-                    'from': address,
-                    'nonce': nonce,
-                    'gas': int(gas_estimate * 1.2),
-                    'gasPrice': 0,
-                    'chainId': w3.eth.chain_id
-                })
-
-                signed = w3.eth.account.sign_transaction(
-                    tx,
-                    private_key
-                )
-
-                inicio_envio = time.perf_counter()
-
-                tx_hash = w3.eth.send_raw_transaction(
-                    signed.raw_transaction
-                )
-
-                fim_envio = time.perf_counter()
-
-                receipt = w3.eth.wait_for_transaction_receipt(
-                    tx_hash
-                )
-
-                fim_confirmacao = time.perf_counter()
-
-                nonce += 1
+        except Exception as e:
 
                 resultados.append({
-                    "thread_id": i,
-                    "ok": True,
-                    "tx_hash": tx_hash.hex(),
-                    "confirmada":
-                        receipt.status == 1,
-
-                    "block_number":
-                        receipt.blockNumber,
-
-                    "gas_used":
-                        receipt.gasUsed,
-
-                    "latencia_rpc":
-                        fim_envio - inicio_envio,
-
-                    "latencia_confirmacao":
-                        fim_confirmacao - fim_envio,
-
-                    "latencia_total":
-                        fim_confirmacao - inicio_envio,
-
-                    "latencia_thread":
-                        fim_confirmacao - inicio_thread
+                "ok": False,
+                "erro": str(e)
                 })
 
-                nonce += 1
+                time.sleep(0.1)
 
-            except Exception as e:
+                continue
 
-                    resultados.append({
-                        "thread_id": i,
-                        "ok": False,
-                         "erro": str(e)
-                    })
-
-        return resultados
-
-    except Exception as e:
-
-        return [{
-            "thread_id": i,
-            "ok": False,
-            "erro": str(e)
-        }]
+    return {
+        "thread_id": i,
+        "address": address,
+        "transacoes": resultados
+    }
 
 # função principal do benchmark, roda o cenário completo e retorna o resumo e os resultados detalhados;
 def rodar_benchmark(total_accounts: int, contract_address):
-    #array de resultados detalhados de cada thread (sucesso, latências, erros, etc)
-    resultados = []
 
-    global w3
+    resultados = []
 
     stop_event = threading.Event()
 
-    # cria total contas
-    accounts = [w3.eth.account.create() for _ in range(total_accounts)]
+    # Cria as contas
+    accounts = [
+        w3.eth.account.create()
+        for _ in range(total_accounts)
+    ]
 
-    # funding
+    # Faz o funding
     txs = fund_account(accounts, 0.01)
 
     for tx in txs:
@@ -233,9 +193,8 @@ def rodar_benchmark(total_accounts: int, contract_address):
 
     inicio_total = time.perf_counter()
 
-
-    #max 12 -> 120
     with ThreadPoolExecutor(max_workers=total_accounts) as executor:
+
         futures = [
             executor.submit(
                 enviar_transacao,
@@ -247,63 +206,36 @@ def rodar_benchmark(total_accounts: int, contract_address):
             for i in range(total_accounts)
         ]
 
-        # deixa executar por 5 segundos
-        time.sleep(1)
+        # Executa por 5 segundos
+        time.sleep(20)
 
         print("Parando benchmark...")
 
-        # cancela futuras tasks ainda não iniciadas
-        executor.shutdown(
-            wait=False,
-            cancel_futures=True
-        )
+        # Sinaliza para as threads encerrarem
+        stop_event.set()
 
-        for idx, future in enumerate(futures):
+        # Aguarda todas as threads terminarem
+        for future in futures:
 
             try:
 
-                if future.done():
+                carteira = future.result()
 
-                    resultado = future.result()
-
-                else:
-
-                    resultado = {
-                        "id": idx,
-                        "ok": False,
-                        "erro": "timeout",
-                        "latencia_thread": 0
-                    }
-
-            except TimeoutError:
-
-                resultado = {
-                    "id": idx,
-                    "ok": False,
-                    "erro": "timeout",
-                    "latencia_thread": 0
-                }
-
-            except CancelledError:
-
-                resultado = {
-                    "id": idx,
-                    "ok": False,
-                    "erro": "task cancelada",
-                    "latencia_thread": 0
-                }
+                resultados.append(carteira)
 
             except Exception as e:
 
-                resultado = {
-                    "id": idx,
-                    "ok": False,
-                    "erro": str(e),
-                    "latencia_thread": 0
-                }
+                resultados.append({
+                    "thread_id": -1,
+                    "address": "",
+                    "transacoes": [
+                        {
+                            "ok": False,
+                            "erro": str(e)
+                        }
+                    ]
+                })
 
-            resultados.append(resultado)
-   
     fim_total = time.perf_counter()
 
     resumo = calcular_resumo(
@@ -313,9 +245,6 @@ def rodar_benchmark(total_accounts: int, contract_address):
         inicio_total,
         fim_total
     )
-
-    #exportar em CSV.
-   
 
     return resumo, resultados
 
@@ -366,7 +295,7 @@ TIMEOUT = 120
 
 # Ajuste os cenarios como quiser
 CENARIOS = [
-    45
+    5
 ]
 
 #, 2, 4, 9, 16, 25, 36, 49, 64, 81, 100, 121, 144, 169,
@@ -386,47 +315,92 @@ def calcular_p95(valores):
     idx = int(0.95 * (len(valores) - 1))
     return valores[idx]
 
+def imprimir_carteiras(resultados):
 
+    print("\n========== CARTEIRAS ==========\n")
+
+    for carteira in resultados:
+
+        txs = carteira["transacoes"]
+
+        sucessos = sum(
+            1
+            for tx in txs
+            if tx.get("ok")
+        )
+
+        falhas = len(txs) - sucessos
+
+        print(f"Thread........: {carteira['thread_id']}")
+        print(f"Carteira......: {carteira['address']}")
+        print(f"Total TX......: {len(txs)}")
+        print(f"Sucessos......: {sucessos}")
+        print(f"Falhas........: {falhas}")
+
+        if sucessos:
+
+            media = statistics.mean([
+                tx["latencia_tx"]
+                for tx in txs
+                if tx.get("ok")
+            ])
+
+            print(f"Latência média: {media:.4f}s")
+
+        print("-" * 60)
     
 def calcular_resumo(resultados, total_tx, threads, inicio_total, fim_total):
 
     tempo_total = fim_total - inicio_total
 
-    sucessos = [r for r in resultados if r.get("ok")]
-    falhas = [r for r in resultados if not r.get("ok")]
-    
+    todas_tx = []
+
+    for carteira in resultados:
+        todas_tx.extend(carteira["transacoes"])
+
+    sucessos = [
+        tx
+        for tx in todas_tx
+        if tx.get("ok")
+    ]
+
+    falhas = [
+        tx
+        for tx in todas_tx
+        if not tx.get("ok")
+    ]
+
     total_tx_executadas = len(sucessos)
 
-    # 🔥 latência da thread (tempo total da execução)
     latencias_thread = [
-        r["latencia_thread"] for r in resultados if "latencia_thread" in r
+        tx["latencia_thread"]
+        for tx in sucessos
+        if "latencia_thread" in tx
     ]
 
-    # 🔥 latência real da tx (melhor métrica agora)
     latencias_tx = [
-        r["latencia_tx"] for r in sucessos if "latencia_tx" in r
+        tx["latencia_tx"]
+        for tx in sucessos
+        if "latencia_tx" in tx
     ]
 
-     # ⛓ latência confirmação blockchain
     latencias_confirmacao = [
-        r["latencia_confirmacao"]
-        for r in sucessos
-        if "latencia_confirmacao" in r
+        tx["latencia_confirmacao"]
+        for tx in sucessos
+        if "latencia_confirmacao" in tx
     ]
 
-     # ⛽ gas usado
     gas_used = [
-        r["gas_used"]
-        for r in sucessos
-        if "gas_used" in r
+        tx["gas_used"]
+        for tx in sucessos
+        if "gas_used" in tx
     ]
 
-    # 🔥 confirmação blockchain
     confirmadas = sum(
-        1 for r in resultados
-        if r.get("confirmada")
+        1
+        for tx in sucessos
+        if tx.get("confirmada")
     )
-   
   
     def p95(lista):
         if not lista:
@@ -580,29 +554,7 @@ def imprimir_resumo(resumo):
 
     print("======================================\n")
 
-def imprimir_amostra_erros(resultados ):
-    erros = [r for r in resultados if not r.get("ok")]
-    limite=len(resultados)
-    print(f"\n❌ Total de erros: {len(erros)}")
 
-    if not erros:
-        print("Nenhum erro encontrado ✅")
-        return
-
-    print(f"Mostrando até {limite} erros:\n")
-
-    for r in erros[:limite]:
-        print(f"TX ID: {r.get('id')}")
-        print(f"Erro: {r.get('erro')}")
-
-        # 🔍 extras úteis (se existirem)
-        if "latencia_thread" in r:
-            print(f"Latência thread: {r.get('latencia_thread'):.4f}s")
-
-        if "tx_hash" in r:
-            print(f"TX Hash: {r.get('tx_hash')}")
-
-        print("-" * 40)
 
 
    
@@ -618,7 +570,8 @@ def main():
     for total_accounts in CENARIOS:
         resumo,resultados = rodar_benchmark(total_accounts, add)
         imprimir_resumo(resumo)
-        imprimir_amostra_erros(resultados)
+        #imprimir_amostra_erros(resultados)
+        imprimir_carteiras(resultados)
     
    
 
