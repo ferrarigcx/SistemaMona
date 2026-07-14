@@ -19,7 +19,7 @@
         "epochlength": 30000,
         "blockperiodseconds": 1,
         "requesttimeoutseconds": 2,
-        "emptyblockperiodseconds": 3600
+        "emptyblockperiodseconds": 20
       }
     },
     "nonce" : "0x0",
