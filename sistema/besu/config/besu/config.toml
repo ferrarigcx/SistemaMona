@@ -11,6 +11,7 @@ rpc-http-enabled=true
 rpc-http-host="0.0.0.0"
 rpc-http-port=8545
 rpc-http-cors-origins=["*"]
+rpc-http-max-active-connections=1024
 
 # ws
 rpc-ws-enabled=true
