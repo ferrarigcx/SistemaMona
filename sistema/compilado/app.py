@@ -224,6 +224,9 @@ def executar(
     upload,
     model_path: str,
     iou_q3: float,
+    radionuclideo: str,
+    gama: float,
+    atividade: float,
 ) -> Generator[tuple[str, Optional[Image.Image]], None, None]:
     STOP_EVENT.clear()
     runner = (runner or "automatos").strip().lower()
@@ -247,6 +250,12 @@ def executar(
         cmd += ["--source", src]
         if model_path.strip():
             cmd += ["--model", model_path.strip()]
+        if (radionuclideo or "").strip():
+            cmd += ["--radionuclideo", radionuclideo.strip()]
+        if gama:
+            cmd += ["--gama", str(gama)]
+        if atividade:
+            cmd += ["--atividade", str(atividade)]
 
     env = os.environ.copy()
     env.update(
@@ -320,6 +329,24 @@ with gr.Blocks(title="Automatos - Controle") as demo:
         info="Escolha um modelo encontrado no projeto ou digite um caminho customizado",
         allow_custom_value=True,
     )
+    with gr.Row():
+        radionuclideo_box = gr.Dropdown(
+            choices=["I-131", "Tc-99m", "Lu-177", "Ga-68", "F-18"],
+            value=None,
+            label="Radionuclídeo",
+            info="Informado antes do manuseio (lista provisória, pode digitar outro nome)",
+            allow_custom_value=True,
+        )
+        gama_box = gr.Number(
+            value=None,
+            label="Constante Gama (µSv·m²/(MBq·h))",
+            info="Valor específico do radionuclídeo, informado manualmente",
+        )
+        atividade_box = gr.Number(
+            value=None,
+            label="Atividade (MBq)",
+            info="Atividade da amostra no momento do manuseio",
+        )
     executar_btn = gr.Button("Executar")
     parar_btn = gr.Button("Parar", variant="stop")
     with gr.Row():
@@ -337,7 +364,17 @@ with gr.Blocks(title="Automatos - Controle") as demo:
 
     executar_btn.click(
         fn=executar,
-        inputs=[modo, processo, source_box, upload_box, model_box, iou_slider],
+        inputs=[
+            modo,
+            processo,
+            source_box,
+            upload_box,
+            model_box,
+            iou_slider,
+            radionuclideo_box,
+            gama_box,
+            atividade_box,
+        ],
         outputs=[log_box, video_box],
     )
     parar_btn.click(parar, inputs=log_box, outputs=log_box)

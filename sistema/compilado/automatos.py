@@ -1,6 +1,8 @@
 import hashlib
+import json
 import os
 import re
+import sqlite3
 import subprocess
 import time
 from collections import deque
@@ -83,6 +85,38 @@ def area(box) -> float:
     except Exception:
         return 0.0
     return max(0.0, x2 - x1) * max(0.0, y2 - y1)
+
+
+def distancia_centros(a, b) -> float:
+    """Distancia euclidiana (em pixels) entre os centros de duas bounding boxes."""
+    ax, ay = centro(a)
+    bx, by = centro(b)
+    return ((ax - bx) ** 2 + (ay - by) ** 2) ** 0.5
+
+
+# Altura real do ativimetro (cm). Usada como referencia de escala por nao variar
+# com a rotacao do equipamento em torno do eixo vertical (ao contrario da largura,
+# que muda conforme a face frontal ou lateral aparece para a camera).
+ATIVIMETRO_ALTURA_CM = float(os.getenv("ATIVIMETRO_ALTURA_CM", "40"))
+
+
+def escala_cm_por_pixel(box_ativimetro, altura_real_cm: float = ATIVIMETRO_ALTURA_CM) -> Optional[float]:
+    """Fator de conversao px->cm a partir da altura detectada do ativimetro no frame atual."""
+    try:
+        _, y1, _, y2 = box_ativimetro
+    except Exception:
+        return None
+    altura_px = abs(y2 - y1)
+    if altura_px <= 0:
+        return None
+    return altura_real_cm / altura_px
+
+
+def distancia_real_cm(a, b, escala: float) -> Optional[float]:
+    """Distancia real estimada (cm) entre os centros de duas boxes, usando a escala px->cm."""
+    if not escala or escala <= 0:
+        return None
+    return distancia_centros(a, b) * escala
 
 
 def _normalizar_label(label) -> str:
@@ -406,8 +440,156 @@ class BlockchainClient:
             return False
         return self._enviar_para_blockchain(file_hash)
 
+    def register_record(self, file_hash: str, descricao: str) -> bool:
+        """Registra na blockchain um hash ja calculado (ex: de um registro de dose), sem precisar de arquivo."""
+        if not self.enabled:
+            return False
+        self._log(f"registrando evento '{descricao}' com hash {file_hash}")
+        if self._check_registered(file_hash):
+            self._log("hash do evento ja estava presente no contrato. Nenhum envio necessario.")
+            return False
+        return self._enviar_para_blockchain(file_hash)
+
     def reportar_nao_conformidade(self, registro: dict) -> None:
         return
+
+def taxa_dose_uSv_h(gama: float, atividade_mbq: float, distancia_cm: Optional[float]) -> Optional[float]:
+    """Taxa de dose instantanea (uSv/h) pela lei do inverso do quadrado: Hdot = Gama*A/r^2.
+
+    Gama em uSv*m2/(MBq*h), atividade em MBq, distancia informada em cm (convertida para m).
+    """
+    if distancia_cm is None or distancia_cm <= 0:
+        return None
+    if not gama or not atividade_mbq:
+        return None
+    distancia_m = distancia_cm / 100.0
+    return (gama * atividade_mbq) / (distancia_m ** 2)
+
+
+DOSE_LIMITE_MSV = float(os.getenv("DOSE_LIMITE_MSV", "0.007"))
+DOSE_DB_PATH = BASE_DIR / "registros_offchain.db"
+
+
+class DoseAcumulador:
+    """Integra a taxa de dose (Hdot) ao longo do tempo (H(t) = integral de Hdot dt) e dispara
+    um evento 'dose_alta' com registro imutavel na blockchain quando a dose acumulada do
+    procedimento ultrapassa o limite configurado (NN 3.01)."""
+
+    def __init__(
+        self,
+        radionuclideo: str,
+        gama: float,
+        atividade_mbq: float,
+        blockchain_client: Optional["BlockchainClient"] = None,
+        limite_msv: float = DOSE_LIMITE_MSV,
+    ):
+        self.radionuclideo = radionuclideo or "desconhecido"
+        self.gama = gama
+        self.atividade_mbq = atividade_mbq
+        self.limite_msv = limite_msv
+        self.blockchain_client = blockchain_client if blockchain_client and blockchain_client.enabled else None
+        self.dose_acumulada_usv = 0.0
+        self.last_ts: Optional[float] = None
+        self.alerta_disparado = False
+        self._inicializar_db()
+        self._log(
+            f"rastreamento ativo. radionuclideo={self.radionuclideo} gama={self.gama} "
+            f"atividade={self.atividade_mbq}MBq limite={self.limite_msv}mSv"
+        )
+
+    def _log(self, msg: str) -> None:
+        print(f"[dose] {msg}")
+
+    def _inicializar_db(self) -> None:
+        try:
+            con = sqlite3.connect(DOSE_DB_PATH)
+            con.execute(
+                """
+                CREATE TABLE IF NOT EXISTS eventos_dose (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    radionuclideo TEXT NOT NULL,
+                    gama REAL NOT NULL,
+                    atividade_mbq REAL NOT NULL,
+                    distancia_cm REAL,
+                    dose_acumulada_msv REAL NOT NULL,
+                    limite_msv REAL NOT NULL,
+                    hash_registro TEXT,
+                    contract_address TEXT,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+            con.commit()
+            con.close()
+        except Exception as exc:
+            self._log(f"falha ao inicializar banco local: {exc}")
+
+    def ingest(self, timestamp_sec: float, distancia_cm: Optional[float]) -> None:
+        if self.last_ts is None:
+            self.last_ts = timestamp_sec
+            return
+        dt_h = max(0.0, timestamp_sec - self.last_ts) / 3600.0
+        self.last_ts = timestamp_sec
+        taxa = taxa_dose_uSv_h(self.gama, self.atividade_mbq, distancia_cm)
+        if taxa is None:
+            return
+        self.dose_acumulada_usv += taxa * dt_h
+        dose_msv = self.dose_acumulada_usv / 1000.0
+        if (not self.alerta_disparado) and dose_msv > self.limite_msv:
+            self.alerta_disparado = True
+            self._disparar_alerta(timestamp_sec, distancia_cm, dose_msv)
+
+    def _disparar_alerta(self, timestamp_sec: float, distancia_cm: Optional[float], dose_msv: float) -> None:
+        self._log(
+            f"EVENTO dose_alta: dose acumulada {dose_msv:.5f} mSv ultrapassou o limite "
+            f"{self.limite_msv:.5f} mSv em {timestamp_sec:.2f}s do video (radionuclideo={self.radionuclideo})"
+        )
+        registro = {
+            "tipo": "dose_alta",
+            "radionuclideo": self.radionuclideo,
+            "gama_uSv_m2_MBq_h": self.gama,
+            "atividade_mbq": self.atividade_mbq,
+            "distancia_cm": round(distancia_cm, 2) if distancia_cm is not None else None,
+            "dose_acumulada_msv": round(dose_msv, 6),
+            "limite_msv": self.limite_msv,
+            "ts_video_seg": round(timestamp_sec, 2),
+        }
+        hash_registro = self._salvar_local(registro)
+        if self.blockchain_client and hash_registro:
+            self.blockchain_client.register_record(hash_registro, "Evento dose_alta")
+
+    def _salvar_local(self, registro: dict) -> Optional[str]:
+        payload = json.dumps(registro, sort_keys=True).encode("utf-8")
+        hash_registro = "0x" + hashlib.sha256(payload).hexdigest()
+        try:
+            con = sqlite3.connect(DOSE_DB_PATH)
+            con.execute(
+                """
+                INSERT INTO eventos_dose
+                    (radionuclideo, gama, atividade_mbq, distancia_cm, dose_acumulada_msv, limite_msv, hash_registro, contract_address)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    registro["radionuclideo"],
+                    registro["gama_uSv_m2_MBq_h"],
+                    registro["atividade_mbq"],
+                    registro["distancia_cm"],
+                    registro["dose_acumulada_msv"],
+                    registro["limite_msv"],
+                    hash_registro,
+                    self.blockchain_client.contract_address if self.blockchain_client else "",
+                ),
+            )
+            con.commit()
+            con.close()
+        except Exception as exc:
+            self._log(f"falha ao salvar registro local: {exc}")
+        return hash_registro
+
+    def finish(self) -> None:
+        dose_msv = self.dose_acumulada_usv / 1000.0
+        self._log(f"fim do video. dose acumulada estimada: {dose_msv:.6f} mSv (limite {self.limite_msv:.5f} mSv).")
+
 
 class AFNRefinado:
     def __init__(self, audit_mode: bool = False, blockchain_client: Optional[BlockchainClient] = None):
@@ -663,7 +845,20 @@ def _format_seconds_label(value: Optional[float]) -> str:
     return f"{minutes:02d}:{seconds:02d}"
 
 
-def _stream_from_capture(model, cap, afn, clipper: Optional[NonConformityClipper] = None):
+def _extrair_box_por_label(objetos, boxes, labels_alvo: set) -> Optional[list]:
+    for i, nome in enumerate(objetos):
+        if nome in labels_alvo and i < len(boxes):
+            return boxes[i]
+    return None
+
+
+def _stream_from_capture(
+    model,
+    cap,
+    afn,
+    clipper: Optional[NonConformityClipper] = None,
+    dose_acumulador: Optional[DoseAcumulador] = None,
+):
     import cv2
     import numpy as np
     WIN = "YOLO + AFN"
@@ -836,6 +1031,16 @@ def _stream_from_capture(model, cap, afn, clipper: Optional[NonConformityClipper
         critical_reason = detectar_nao_conformidade_critica(objetos)
         if clipper:
             clipper.ingest(timestamp_sec, frame, critical_reason)
+        if dose_acumulador is not None:
+            box_mao = _extrair_box_por_label(objetos, boxes, {"mao com luva", "mao sem luva"})
+            box_amostra = _extrair_box_por_label(objetos, boxes, {"amostra"})
+            box_ativimetro = _extrair_box_por_label(objetos, boxes, {"ativimetro"})
+            distancia_cm = None
+            if box_mao and box_amostra and box_ativimetro:
+                escala = escala_cm_por_pixel(box_ativimetro)
+                if escala:
+                    distancia_cm = distancia_real_cm(box_mao, box_amostra, escala)
+            dose_acumulador.ingest(timestamp_sec, distancia_cm)
         r = afn.processar(objetos, boxes, objetos)
         if r == "fim":
             print("[info] Autômato finalizado. Saindo do loop de captura.")
@@ -857,6 +1062,8 @@ def _stream_from_capture(model, cap, afn, clipper: Optional[NonConformityClipper
     try:
         if clipper:
             clipper.finish()
+        if dose_acumulador is not None:
+            dose_acumulador.finish()
         cap.release()
         if SHOW_GUI:
             import cv2 as _cv
@@ -873,6 +1080,12 @@ def main():
     parser.add_argument("--model", type=str, default=os.getenv("MODEL", ""),
                         help="Caminho do modelo .pt (padrão: ModeloTreinadoV3.pt)")
     parser.add_argument("--simulate", action="store_true", help="Usar palavras simuladas (modo legado)")
+    parser.add_argument("--radionuclideo", type=str, default=os.getenv("RADIONUCLIDEO", ""),
+                        help="Nome do radionuclideo em uso no manuseio")
+    parser.add_argument("--gama", type=float, default=float(os.getenv("GAMA", "0") or 0),
+                        help="Constante gama especifica do radionuclideo (uSv*m2/(MBq*h))")
+    parser.add_argument("--atividade", type=float, default=float(os.getenv("ATIVIDADE_MBQ", "0") or 0),
+                        help="Atividade da amostra no momento do manuseio, em MBq")
     args = parser.parse_args()
 
     _mode = os.getenv("MODO", "").strip().lower()
@@ -952,7 +1165,18 @@ def main():
     else:
         print("[trechos] extração automática disponível apenas para vídeos em arquivo nesta versão.")
 
-    _stream_from_capture(modelo, cap, afn, clipper)
+    dose_acumulador = None
+    if args.gama > 0 and args.atividade > 0:
+        dose_acumulador = DoseAcumulador(
+            radionuclideo=args.radionuclideo,
+            gama=args.gama,
+            atividade_mbq=args.atividade,
+            blockchain_client=blockchain_client,
+        )
+    else:
+        print("[dose] gama/atividade nao informados; rastreamento de dose desativado.")
+
+    _stream_from_capture(modelo, cap, afn, clipper, dose_acumulador)
 
 
 if __name__ == "__main__":
