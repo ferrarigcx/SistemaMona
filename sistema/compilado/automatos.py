@@ -467,6 +467,7 @@ def taxa_dose_uSv_h(gama: float, atividade_mbq: float, distancia_cm: Optional[fl
 
 
 DOSE_LIMITE_MSV = float(os.getenv("DOSE_LIMITE_MSV", "0.007"))
+DOSE_DIARIA_LIMITE_MSV = float(os.getenv("DOSE_DIARIA_LIMITE_MSV", "0.2"))
 DOSE_DB_PATH = BASE_DIR / "registros_offchain.db"
 
 
@@ -516,6 +517,17 @@ class DoseAcumulador:
                     hash_registro TEXT,
                     contract_address TEXT,
                     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+            con.execute(
+                """
+                CREATE TABLE IF NOT EXISTS dose_diaria (
+                    data TEXT PRIMARY KEY,
+                    dose_acumulada_msv REAL NOT NULL,
+                    hash_registro TEXT,
+                    contract_address TEXT,
+                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
                 )
                 """
             )
@@ -589,6 +601,62 @@ class DoseAcumulador:
     def finish(self) -> None:
         dose_msv = self.dose_acumulada_usv / 1000.0
         self._log(f"fim do video. dose acumulada estimada: {dose_msv:.6f} mSv (limite {self.limite_msv:.5f} mSv).")
+        self._atualizar_dose_diaria(dose_msv)
+
+    def _atualizar_dose_diaria(self, dose_msv_video: float) -> None:
+        """Soma a dose deste video ao total do dia (data real do manuseio) e, quando o total
+        ultrapassa DOSE_DIARIA_LIMITE_MSV, registra o total atualizado na blockchain -- sem
+        alerta, apenas para permitir depois somar os dias e obter a dose mensal recebida."""
+        hoje = time.strftime("%Y-%m-%d")
+        try:
+            con = sqlite3.connect(DOSE_DB_PATH)
+            cur = con.execute("SELECT dose_acumulada_msv FROM dose_diaria WHERE data = ?", (hoje,))
+            row = cur.fetchone()
+            total_anterior = row[0] if row else 0.0
+            novo_total = total_anterior + dose_msv_video
+            con.execute(
+                """
+                INSERT INTO dose_diaria (data, dose_acumulada_msv, updated_at)
+                VALUES (?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(data) DO UPDATE SET
+                    dose_acumulada_msv = excluded.dose_acumulada_msv,
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                (hoje, novo_total),
+            )
+            con.commit()
+        except Exception as exc:
+            self._log(f"falha ao atualizar dose diaria local: {exc}")
+            return
+        finally:
+            con.close()
+
+        self._log(f"dose total do dia {hoje}: {novo_total:.6f} mSv.")
+        if novo_total > DOSE_DIARIA_LIMITE_MSV:
+            registro = {
+                "tipo": "dose_diaria",
+                "data": hoje,
+                "dose_diaria_msv": round(novo_total, 6),
+                "limite_msv": DOSE_DIARIA_LIMITE_MSV,
+            }
+            payload = json.dumps(registro, sort_keys=True).encode("utf-8")
+            hash_registro = "0x" + hashlib.sha256(payload).hexdigest()
+            try:
+                con = sqlite3.connect(DOSE_DB_PATH)
+                con.execute(
+                    "UPDATE dose_diaria SET hash_registro = ?, contract_address = ? WHERE data = ?",
+                    (hash_registro, self.blockchain_client.contract_address if self.blockchain_client else "", hoje),
+                )
+                con.commit()
+                con.close()
+            except Exception as exc:
+                self._log(f"falha ao salvar hash da dose diaria: {exc}")
+            if self.blockchain_client:
+                self._log(
+                    f"dose diaria ({novo_total:.6f} mSv) acima do limite ({DOSE_DIARIA_LIMITE_MSV} mSv); "
+                    f"registrando na blockchain para soma mensal."
+                )
+                self.blockchain_client.register_record(hash_registro, "Dose diaria acima do limite")
 
 
 class AFNRefinado:
